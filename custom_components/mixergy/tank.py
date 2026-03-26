@@ -36,6 +36,7 @@ class Tank:
         self._should_connect = False
         self._stomp_conn: stomp.WSConnection | None = None
         self._stomp_conn_task: asyncio.Task | None = None
+        self._stomp_retry_handle: asyncio.TimerHandle | None = None
 
         # Parameters
         self.username = username
@@ -204,99 +205,144 @@ class Tank:
     @callback
     def _start_connection(self):
 
+        if self._stomp_retry_handle is not None:
+            self._stomp_retry_handle.cancel()
+            self._stomp_retry_handle = None
+
         if not self._should_connect:
             _LOGGER.debug("Not starting STOMP connection")
+            return
+
+        if self._stomp_conn is not None:
+            _LOGGER.debug("STOMP connection already active")
+            return
+
+        if self._stomp_conn_task is not None and not self._stomp_conn_task.done():
+            _LOGGER.debug("STOMP connection attempt already in progress")
             return
 
         async def _connection_runner() -> None:
             _LOGGER.debug("STOMP starting connection")
 
-            # Fetch data before connecting so that we have an up-to-date state
-            # since the STOMP connection will only give us changes.
-            await self.fetch_data()
-
-            host_tuples = [(STOMP_ENDPOINT, 443)]
-            _LOGGER.debug("STOMP creating connection")
-            stomp_conn = stomp.WSConnection(host_tuples, ws_path=STOMP_WS_PATH)
-            _LOGGER.debug("STOMP connection setting SSL")
-            stomp_conn.set_ssl(host_tuples)
-
-            class StompListener(stomp.listener.ConnectionListener):
-                def __init__(self, tank: Tank):
-                    self._tank = tank
-
-                def on_disconnected(self):
-                    _LOGGER.debug("STOMP connection: on_disconnected")
-                    self._tank._stomp_conn = None
-                    self._tank._hass.loop.call_later(STOMP_RETRY_TIMER, self._tank._start_connection)
-
-                def on_message(self, frame):
-                    _LOGGER.debug("STOMP connection: on_message")
-                    _LOGGER.debug(frame.body)
-
-                    message = json.loads(frame.body)
-                    type = message["type"]
-                    payload = message["payload"]
-
-                    if type == "Measurement":
-                        self._tank._update_from_latest_measurement(payload)
-
-                    elif type == "Event":
-                        event = payload["event"]
-
-                        if event == "Settings":
-                            additional = json.loads(payload["additional"])
-                            self._tank._update_from_new_settings(additional)
-
-                        elif event == "Schedule":
-                            additional = json.loads(payload["additional"])
-                            self._tank._update_from_new_schedule(additional)
-
-                        elif event == "State":
-                            additional = json.loads(payload["additional"])
-                            self._tank._update_from_new_state(additional)
-
-                    self._tank._hass.loop.create_task(self._tank._publish_updates())
-
-            listener = StompListener(self)
-            _LOGGER.debug("STOMP connection setting listener")
-            stomp_conn.set_listener("listener", listener)
-
             try:
-                headers = {'Token': self._token}
-
                 # We do this dance setting the default timeout to 15, then connecting, then setting
                 # the timeout on the underlying socket to `None` because there is no other way to
                 # ensure that the call to `connect` doesn't block forever if the connection cannot
                 # be made. The dance here will ensure that the call to `connect` times-out if it
                 # takes longer than 15 seconds, but then the socket is set to never timeout so that
                 # it stays connected forever.
-                _LOGGER.debug("STOMP connecting socket")
-                websocket_default_timeout = websocket.getdefaulttimeout()
-                websocket.setdefaulttimeout(15)
-                stomp_conn.connect(headers=headers, with_connect_command=True)
-                stomp_conn.transport.socket.timeout = None
-                websocket.setdefaulttimeout(websocket_default_timeout)
+                # Fetch data before connecting so that we have an up-to-date state
+                # since the STOMP connection will only give us changes.
+                await self.fetch_data()
 
-                _LOGGER.debug("STOMP waiting for transport connection")
-                stomp_conn.transport.wait_for_connection(timeout=60)
-                _LOGGER.debug("STOMP connected")
+                host_tuples = [(STOMP_ENDPOINT, 443)]
+                _LOGGER.debug("STOMP creating connection")
+                stomp_conn = stomp.WSConnection(host_tuples, ws_path=STOMP_WS_PATH)
+                _LOGGER.debug("STOMP connection setting SSL")
+                stomp_conn.set_ssl(host_tuples)
 
+                class StompListener(stomp.listener.ConnectionListener):
+                    def __init__(self, tank: Tank):
+                        self._tank = tank
+
+                    def on_disconnected(self):
+                        _LOGGER.debug("STOMP connection: on_disconnected")
+                        self._tank._stomp_conn = None
+                        self._tank._hass.loop.call_soon_threadsafe(self._tank._schedule_reconnect)
+
+                    def on_message(self, frame):
+                        _LOGGER.debug("STOMP connection: on_message")
+                        _LOGGER.debug(frame.body)
+
+                        message = json.loads(frame.body)
+                        type = message["type"]
+                        payload = message["payload"]
+
+                        if type == "Measurement":
+                            self._tank._update_from_latest_measurement(payload)
+
+                        elif type == "Event":
+                            event = payload["event"]
+
+                            if event == "Settings":
+                                additional = json.loads(payload["additional"])
+                                self._tank._update_from_new_settings(additional)
+
+                            elif event == "Schedule":
+                                additional = json.loads(payload["additional"])
+                                self._tank._update_from_new_schedule(additional)
+
+                            elif event == "State":
+                                additional = json.loads(payload["additional"])
+                                self._tank._update_from_new_state(additional)
+
+                        self._tank._hass.loop.call_soon_threadsafe(
+                            self._tank._hass.async_create_task,
+                            self._tank._publish_updates(),
+                        )
+
+                listener = StompListener(self)
+                _LOGGER.debug("STOMP connection setting listener")
+                stomp_conn.set_listener("listener", listener)
+
+                headers = {'Token': self._token}
                 topic = f'/topic/tank/{self._uuid}/poll'
-                stomp_conn.subscribe(destination=topic, id=self._id, ack="auto")
-                _LOGGER.debug(f"STOMP subscribed to {topic}")
+                await self._hass.async_add_executor_job(
+                    self._connect_and_subscribe_stomp,
+                    stomp_conn,
+                    headers,
+                    topic,
+                )
 
+                _LOGGER.debug("STOMP connected and subscribed to %s", topic)
+                self._stomp_conn = stomp_conn
+
+            except asyncio.CancelledError:
+                raise
             except stomp.exception.ConnectFailedException:
                 _LOGGER.error("Failed to connect to Mixergy STOMP server")
-                self._hass.loop.call_later(STOMP_RETRY_TIMER, self._start_connection)
-
+                self._schedule_reconnect()
+            except (aiohttp.ClientError, TimeoutError) as e:
+                _LOGGER.warning("Network error preparing STOMP connection: %s", e)
+                self._schedule_reconnect()
             except Exception as e:
                 _LOGGER.error(f"Unexpected exception connecting to Mixergy STOMP server:\n{e}")
-                self._hass.loop.call_later(STOMP_RETRY_TIMER, self._start_connection)
-
-            self._stomp_conn = stomp_conn
+                self._schedule_reconnect()
 
         self._stomp_conn_task = self._hass.loop.create_task(_connection_runner())
+
+    @callback
+    def _schedule_reconnect(self):
+        if not self._should_connect:
+            return
+
+        if self._stomp_retry_handle is not None and not self._stomp_retry_handle.cancelled():
+            return
+
+        _LOGGER.debug("Scheduling STOMP reconnect in %s seconds", STOMP_RETRY_TIMER)
+        self._stomp_retry_handle = self._hass.loop.call_later(
+            STOMP_RETRY_TIMER,
+            self._run_scheduled_reconnect,
+        )
+
+    @callback
+    def _run_scheduled_reconnect(self):
+        self._stomp_retry_handle = None
+        self._start_connection()
+
+    def _connect_and_subscribe_stomp(self, stomp_conn, headers, topic):
+        _LOGGER.debug("STOMP connecting socket")
+        websocket_default_timeout = websocket.getdefaulttimeout()
+        try:
+            websocket.setdefaulttimeout(15)
+            stomp_conn.connect(headers=headers, with_connect_command=True)
+            _LOGGER.debug("STOMP waiting for transport connection")
+            stomp_conn.transport.wait_for_connection(timeout=60)
+            if stomp_conn.transport.socket is not None:
+                stomp_conn.transport.socket.timeout = None
+            stomp_conn.subscribe(destination=topic, id=self._id, ack="auto")
+        finally:
+            websocket.setdefaulttimeout(websocket_default_timeout)
 
     @callback
     def stop(self):
@@ -305,11 +351,24 @@ class Tank:
 
         self._should_connect = False
 
+        if self._stomp_retry_handle is not None:
+            self._stomp_retry_handle.cancel()
+            self._stomp_retry_handle = None
+
         if self._stomp_conn_task is not None:
             self._stomp_conn_task.cancel()
+            self._stomp_conn_task = None
 
         if self._stomp_conn is not None:
-            self._stomp_conn.disconnect()
+            stomp_conn = self._stomp_conn
+            self._stomp_conn = None
+            self._hass.async_create_task(self._async_disconnect(stomp_conn))
+
+    async def _async_disconnect(self, stomp_conn: stomp.WSConnection) -> None:
+        try:
+            await self._hass.async_add_executor_job(stomp_conn.disconnect)
+        except Exception as e:
+            _LOGGER.debug("Exception while disconnecting STOMP connection: %s", e)
 
     async def _authenticate(self):
 
