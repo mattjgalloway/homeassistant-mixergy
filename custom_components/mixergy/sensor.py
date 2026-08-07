@@ -1,7 +1,6 @@
 import logging
 from datetime import timedelta
 from homeassistant.const import UnitOfPower, UnitOfTemperature, PERCENTAGE, STATE_OFF
-from homeassistant.core import HomeAssistant
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.components.integration.sensor import IntegrationSensor
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
@@ -328,9 +327,8 @@ class PowerSensor(SensorBase):
 
 class EnergySensor(IntegrationSensor):
 
-    def __init__(self, hass: HomeAssistant, tank:Tank):
+    def __init__(self, tank:Tank):
         super().__init__(
-            #hass = hass,
             name="Mixergy Electric Heat Energy",
             source_entity="sensor.mixergy_electric_heat_power",
             round_digits=2,
@@ -376,9 +374,8 @@ class PVPowerSensor(SensorBase):
 
 class PVEnergySensor(IntegrationSensor):
 
-    def __init__(self, hass: HomeAssistant, tank:Tank):
+    def __init__(self, tank:Tank):
         super().__init__(
-            #hass = hass,
             name="Mixergy Electric PV Energy",
             source_entity="sensor.mixergy_electric_pv_power",
             round_digits=2,
